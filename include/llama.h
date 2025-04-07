@@ -657,6 +657,22 @@ extern "C" {
     // Clear the KV cache - both cell info is erased and KV data is zeroed
     LLAMA_API void llama_kv_self_clear(
             struct llama_context * ctx);
+ 
+    // Sliding Window Management
+    // If the KV cache size overflows, store more effective KV values in the KV cache.
+    LLAMA_API int32_t llama_kv_self_shift(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   n_past,
+                       int32_t     n_keep);
+
+    LLAMA_API void llama_kv_self_shift_extend(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos * n_past,
+                       int32_t   * ga_i,
+                       int32_t     ga_n,
+                       int32_t     ga_w);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
