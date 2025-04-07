@@ -37,6 +37,8 @@ bool llama_kv_cache_unified::init(
     head = 0;
     size = kv_size;
     used = 0;
+    discard_ratio = 0.1f;  
+    min_prefix_size = 4;
 
     this->type_k = type_k;
     this->type_v = type_v;
@@ -427,6 +429,55 @@ void llama_kv_cache_unified::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
         }
     }
 }
+
+int32_t llama_kv_cache_unified::shift(llama_seq_id seq_id, llama_pos  n_past, int32_t n_keep) {
+    // 计算滑动窗口大小
+    int32_t prefix_size = std::max(min_prefix_size, std::min(n_keep, n_past-4));
+
+    int32_t window_size = n_past - prefix_size;
+
+    // 计算要丢弃的token数量
+    int32_t n_discard = (int32_t)(window_size * discard_ratio);
+
+    if (n_discard <= 0) {
+        return n_discard;
+    }
+
+    LLAMA_LOG_DEBUG("sliding window: prefix_size=%d, n_past=%d, n_discard=%d\n", prefix_size, n_past, n_discard);
+
+    // 移除窗口中的旧tokens
+    seq_rm (seq_id, prefix_size            , prefix_size + n_discard);
+
+    // 重新定位剩余tokens
+    seq_add(seq_id, prefix_size + n_discard, n_past, -n_discard);
+
+    return n_discard;
+}
+
+void llama_kv_cache_unified::shift_extend(llama_seq_id seq_id, llama_pos * n_past, int32_t * ga_i, int32_t ga_n, int32_t ga_w) {
+
+    while (*n_past >= *ga_i + ga_w) {
+        const int ib = (ga_n*(*ga_i))/ga_w;
+        const int bd = (ga_w/ga_n)*(ga_n - 1);
+        const int dd = (ga_w/ga_n) - ib*bd - ga_w;
+
+        LLAMA_LOG_DEBUG("\n");
+        LLAMA_LOG_DEBUG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", *ga_i, *n_past, ib*bd, *ga_i + ib*bd, *n_past + ib*bd);
+        LLAMA_LOG_DEBUG("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", *ga_i + ib*bd, *ga_i + ib*bd + ga_w, ga_n, (*ga_i + ib*bd)/ga_n, (*ga_i + ib*bd + ga_w)/ga_n);
+        LLAMA_LOG_DEBUG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", *ga_i + ib*bd + ga_w, *n_past + ib*bd, dd, *ga_i + ib*bd + ga_w + dd, *n_past + ib*bd + dd);
+
+        seq_add(seq_id, *ga_i,                *n_past,              ib*bd);
+        seq_div(seq_id, *ga_i + ib*bd,        *ga_i + ib*bd + ga_w, ga_n);
+        seq_add(seq_id, *ga_i + ib*bd + ga_w, *n_past + ib*bd,      dd);
+
+        *n_past -= bd;
+
+        *ga_i += ga_w/ga_n;
+
+        LLAMA_LOG_DEBUG("\nn_past_old = %d, n_past = %d, ga_i = %d\n\n", *n_past + bd, *n_past, *ga_i);
+    }
+}
+
 
 llama_pos llama_kv_cache_unified::seq_pos_max(llama_seq_id seq_id) {
     llama_pos result = 0;
@@ -1246,6 +1297,32 @@ void llama_kv_cache_clear(llama_kv_cache * kv) {
     }
 
     kv->clear();
+}
+
+int32_t llama_kv_cache_shift(
+        llama_kv_cache * kv,
+          llama_seq_id   seq_id,
+             llama_pos   n_past,
+             int32_t     n_keep) {
+    if (!kv) {
+        return 0;
+    }
+
+    return kv->shift(seq_id, n_past, n_keep);
+}
+
+void llama_kv_cache_shift_extend(
+        llama_kv_cache * kv,
+          llama_seq_id   seq_id,
+            llama_pos  * n_past,
+            int32_t    * ga_i,
+            int32_t      ga_n,
+            int32_t      ga_w) {
+    if (!kv) {
+        return;
+    }
+
+    kv->shift_extend(seq_id, n_past, ga_i, ga_n, ga_w);
 }
 
 bool llama_kv_cache_seq_rm(

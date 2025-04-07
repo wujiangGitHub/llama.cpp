@@ -99,6 +99,10 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos delta) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    int32_t shift(llama_seq_id seq_id,                              llama_pos n_past, int32_t n_keep) override;
+    
+    void shift_extend(llama_seq_id seq_id, llama_pos * n_past, int32_t * ga_i, int32_t ga_n, int32_t ga_w) override;
+
     llama_pos seq_pos_max(llama_seq_id seq_id) override;
 
     bool get_can_shift() const override;
@@ -157,6 +161,9 @@ public:
 
     // computed before each graph build
     uint32_t n = 0;
+
+    float discard_ratio;     // 每次丢弃10%的窗口内容
+    int32_t min_prefix_size; //滑动窗口最小的固定前缀
 
     std::vector<llama_kv_cell> cells;
 
@@ -242,6 +249,20 @@ int32_t llama_kv_cache_n_tokens(const llama_kv_cache * kv);
 int32_t llama_kv_cache_used_cells(const llama_kv_cache * kv);
 
 void llama_kv_cache_clear(llama_kv_cache * kv);
+
+int32_t llama_kv_cache_shift(
+        llama_kv_cache * kv,
+          llama_seq_id   seq_id,
+             llama_pos   n_past,
+             int32_t     n_keep);
+
+void llama_kv_cache_shift_extend(
+        llama_kv_cache * kv,
+          llama_seq_id   seq_id,
+            llama_pos  * n_past,
+            int32_t    * ga_i,
+            int32_t      ga_n,
+            int32_t      ga_w);
 
 bool llama_kv_cache_seq_rm(
         llama_kv_cache * kv,

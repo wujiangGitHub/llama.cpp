@@ -2835,13 +2835,9 @@ struct server_context {
 
                 // Shift context
                 const int n_keep    = slot.params.n_keep + add_bos_token;
-                const int n_left    = slot.n_past - n_keep;
-                const int n_discard = slot.params.n_discard ? slot.params.n_discard : (n_left / 2);
 
-                SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
-
-                llama_kv_self_seq_rm (ctx, slot.id, n_keep            , n_keep + n_discard);
-                llama_kv_self_seq_add(ctx, slot.id, n_keep + n_discard, slot.n_past,        -n_discard);
+                int32_t n_discard = llama_kv_self_shift(ctx, slot.id, slot.n_past , n_keep);
+                SLT_WRN(slot, "slot context shift, n_keep = %d, n_discard = %d\n", n_keep, n_discard);
 
                 if (slot.params.cache_prompt) {
                     for (size_t i = n_keep + n_discard; i < slot.cache_tokens.size(); i++) {

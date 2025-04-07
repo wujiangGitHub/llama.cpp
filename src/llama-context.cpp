@@ -2524,6 +2524,24 @@ void llama_kv_self_clear(llama_context * ctx) {
     llama_kv_cache_clear(ctx->get_kv_self());
 }
 
+int32_t llama_kv_self_shift(
+        llama_context * ctx,
+         llama_seq_id   seq_id,
+            llama_pos   n_past,
+            int32_t     n_keep) {
+    return llama_kv_cache_shift(ctx->get_kv_self(), seq_id, n_past, n_keep);
+}
+
+void llama_kv_self_shift_extend(
+        llama_context * ctx,
+         llama_seq_id   seq_id,
+            llama_pos * n_past,
+            int32_t   * ga_i,
+            int32_t     ga_n,
+            int32_t     ga_w) {
+    llama_kv_cache_shift_extend(ctx->get_kv_self(), seq_id, n_past, ga_i, ga_n, ga_w);
+}
+
 // deprecated
 bool llama_kv_cache_seq_rm(
         llama_context * ctx,

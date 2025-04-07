@@ -596,17 +596,13 @@ int main(int argc, char ** argv) {
                         break;
                     }
 
-                    const int n_left    = n_past - params.n_keep;
-                    const int n_discard = n_left/2;
-
-                    LOG_DBG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
-                            n_past, n_left, n_ctx, params.n_keep, n_discard);
-
-                    llama_kv_self_seq_rm (ctx, 0, params.n_keep            , params.n_keep + n_discard);
-                    llama_kv_self_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
+                    int32_t n_discard = llama_kv_self_shift(ctx, 0, n_past, params.n_keep);
+                    if (n_discard <= 0) {
+                        LOG_DBG("%s : failed to shift\n", __func__);
+                        break;
+                    }
 
                     n_past -= n_discard;
-
                     LOG_DBG("after swap: n_past = %d\n", n_past);
 
                     LOG_DBG("embd: %s\n", string_from(ctx, embd).c_str());
@@ -616,26 +612,7 @@ int main(int argc, char ** argv) {
                 }
             } else {
                 // context extension via Self-Extend
-                while (n_past >= ga_i + ga_w) {
-                    const int ib = (ga_n*ga_i)/ga_w;
-                    const int bd = (ga_w/ga_n)*(ga_n - 1);
-                    const int dd = (ga_w/ga_n) - ib*bd - ga_w;
-
-                    LOG_DBG("\n");
-                    LOG_DBG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i, n_past, ib*bd, ga_i + ib*bd, n_past + ib*bd);
-                    LOG_DBG("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", ga_i + ib*bd, ga_i + ib*bd + ga_w, ga_n, (ga_i + ib*bd)/ga_n, (ga_i + ib*bd + ga_w)/ga_n);
-                    LOG_DBG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i + ib*bd + ga_w, n_past + ib*bd, dd, ga_i + ib*bd + ga_w + dd, n_past + ib*bd + dd);
-
-                    llama_kv_self_seq_add(ctx, 0, ga_i,                n_past,              ib*bd);
-                    llama_kv_self_seq_div(ctx, 0, ga_i + ib*bd,        ga_i + ib*bd + ga_w, ga_n);
-                    llama_kv_self_seq_add(ctx, 0, ga_i + ib*bd + ga_w, n_past + ib*bd,      dd);
-
-                    n_past -= bd;
-
-                    ga_i += ga_w/ga_n;
-
-                    LOG_DBG("\nn_past_old = %d, n_past = %d, ga_i = %d\n\n", n_past + bd, n_past, ga_i);
-                }
+                llama_kv_self_shift_extend(ctx, 0, &n_past, &ga_i, ga_n, ga_w);
             }
 
             // try to reuse a matching prefix from the loaded session instead of re-eval (via n_past)

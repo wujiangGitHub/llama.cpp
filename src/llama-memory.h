@@ -14,6 +14,9 @@ public:
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos delta) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
+    
+    virtual int32_t shift(llama_seq_id seq_id,                              llama_pos n_past, int32_t n_keep) = 0;
+    virtual void shift_extend(llama_seq_id seq_id, llama_pos * n_past, int32_t * ga_i, int32_t ga_n, int32_t ga_w) = 0;
 
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) = 0;
 
