@@ -192,7 +192,7 @@ int main(int argc, char ** argv) {
     llama_attach_threadpool(ctx, threadpool, threadpool_batch);
 
     const int n_ctx_train = llama_model_n_ctx_train(model);
-    const int n_ctx = llama_n_ctx(ctx);
+    int n_ctx = llama_n_ctx(ctx);
 
     if (n_ctx > n_ctx_train) {
         LOG_WRN("%s: model was trained on only %d context tokens (%d specified)\n", __func__, n_ctx_train, n_ctx);
@@ -586,29 +586,35 @@ int main(int argc, char ** argv) {
                 // - take half of the last (n_ctx - n_keep) tokens and recompute the logits in batches
 
                 if (n_past + (int) embd.size() >= n_ctx) {
-                    if (!params.ctx_shift){
-                        LOG_DBG("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
-                        break;
+                    
+                    if(llama_kv_self_expansion(ctx)) {
+                        n_ctx = llama_n_ctx(ctx);
+                    } else {
+                        if (!params.ctx_shift){
+                            LOG_DBG("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
+                            break;
+                        }
+
+                        if (params.n_predict == -2) {
+                            LOG_DBG("\n\n%s: context full and n_predict == -%d => stopping\n", __func__, params.n_predict);
+                            break;
+                        }
+
+                        int32_t n_discard = llama_kv_self_shift(ctx, 0, n_past, params.n_keep);
+                        if (n_discard <= 0) {
+                            LOG_DBG("%s : failed to shift\n", __func__);
+                            break;
+                        }
+
+                        n_past -= n_discard;
+                        LOG_DBG("after swap: n_past = %d\n", n_past);
+
+                        LOG_DBG("embd: %s\n", string_from(ctx, embd).c_str());
+
+                        LOG_DBG("clear session path\n");
+                        path_session.clear();
                     }
 
-                    if (params.n_predict == -2) {
-                        LOG_DBG("\n\n%s: context full and n_predict == -%d => stopping\n", __func__, params.n_predict);
-                        break;
-                    }
-
-                    int32_t n_discard = llama_kv_self_shift(ctx, 0, n_past, params.n_keep);
-                    if (n_discard <= 0) {
-                        LOG_DBG("%s : failed to shift\n", __func__);
-                        break;
-                    }
-
-                    n_past -= n_discard;
-                    LOG_DBG("after swap: n_past = %d\n", n_past);
-
-                    LOG_DBG("embd: %s\n", string_from(ctx, embd).c_str());
-
-                    LOG_DBG("clear session path\n");
-                    path_session.clear();
                 }
             } else {
                 // context extension via Self-Extend

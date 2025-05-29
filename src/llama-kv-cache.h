@@ -107,6 +107,11 @@ public:
 
     bool get_can_shift() const override;
 
+    bool get_can_resize(uint32_t size) const;
+    
+    // 扩展KV缓存大小
+    bool resize(ggml_context * ctx0, ggml_cgraph * gf, ggml_backend_sched * sched, uint32_t new_size);
+
     // find an empty slot of size "n_tokens" in the cache
     // updates the cache head
     // returns a structure holding information about the slot found
@@ -175,7 +180,11 @@ private:
     ggml_type type_v = GGML_TYPE_F16;
 
     std::vector<ggml_context_ptr>        ctxs;
+    std::vector<ggml_context *>          ctx_l;
+    std::vector<ggml_backend_buffer_type_t> buft_l;
     std::vector<ggml_backend_buffer_ptr> bufs;
+    std::vector<ggml_backend_dev_t>      devs;
+
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;

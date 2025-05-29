@@ -331,8 +331,38 @@ static const char * ggml_backend_cpu_device_get_description(ggml_backend_dev_t d
 
 static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     // TODO
+
+#ifdef __linux__
+    FILE *file = fopen("/proc/meminfo", "r");
+    if (!file) {
+        *free = 0;
+        *total = 0;
+        return;
+    }
+
+    char line[256];
+    size_t mem_total = 0, mem_free = 0, mem_available = 0;
+
+    while (fgets(line, sizeof(line), file)) {
+        if (sscanf(line, "MemTotal: %zu kB", &mem_total) == 1) {
+            continue;
+        }
+        if (sscanf(line, "MemFree: %zu kB", &mem_free) == 1) {
+            continue;
+        }
+        if (sscanf(line, "MemAvailable: %zu kB", &mem_available) == 1) {
+            continue;
+        }
+    }
+
+    fclose(file);
+
+    *total = mem_total * 1024; 
+    *free  = mem_available > 0 ? mem_available * 1024 : mem_free * 1024; // 优先使用 MemAvailable
+#else
     *free = 0;
     *total = 0;
+#endif
 
     GGML_UNUSED(dev);
 }

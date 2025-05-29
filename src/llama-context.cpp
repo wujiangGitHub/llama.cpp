@@ -719,7 +719,7 @@ llm_graph_result_ptr llama_context::build_kv_self_defrag(
 void llama_context::kv_self_update() {
     auto & kv = kv_self;
 
-    bool need_reserve = false;
+    need_reserve = false;
 
     if (kv->has_shift) {
         if (!kv->get_can_shift()) {
@@ -776,30 +776,83 @@ void llama_context::kv_self_update() {
 
         kv->do_defrag = false;
     }
+}
 
+void llama_context::kv_self_reserve() {
     // reserve a worst case graph if needed
-    if (need_reserve) {
-        LLAMA_LOG_DEBUG("%s: reserving a worst case graph\n", __func__);
+    LLAMA_LOG_DEBUG("%s: reserving a worst case graph\n", __func__);
 
-        // build worst-case graph
-        uint32_t n_seqs = 1; // TODO: worst-case number of sequences
-        uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    // build worst-case graph
+    uint32_t n_seqs = 1; // TODO: worst-case number of sequences
+    uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        // simulate full KV cache
-        kv_self->n = kv_self->size;
+    // simulate full KV cache
+    kv_self->n = kv_self->size;
 
-        llama_token token = model.vocab.token_bos(); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
-        llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
+    llama_token token = model.vocab.token_bos(); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
+    llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
 
-        auto * gf = graph_init();
-        graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_DEFAULT);
+    auto * gf = graph_init();
+    graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_DEFAULT);
 
-        // initialize scheduler with the worst-case graph
-        ggml_backend_sched_reset(sched.get());
-        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        }
+    // initialize scheduler with the worst-case graph
+    ggml_backend_sched_reset(sched.get());
+    if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+    } 
+    need_reserve = false;
+}
+
+uint32_t llama_context::kv_self_expansion_size(uint32_t n_tokens) {
+    uint32_t new_size = std::max(kv_self->size * 1.5, n_tokens * 1.5);
+    if (kv_self->get_can_resize(new_size)) {
+        return new_size;
+    } 
+    return 0;
+}
+
+bool llama_context::kv_self_expansion(uint32_t n_tokens) {
+    uint32_t size = kv_self_expansion_size(n_tokens);
+    if(size == 0) {
+        LLAMA_LOG_DEBUG("%s: 没有足够的内存空间去扩容\n", __func__);
+        return false;
     }
+    LLAMA_LOG_INFO("%s: (当前: %u, 扩容: %u)\n", __func__, kv_self->size, size);
+
+    if (size <= kv_self->size) {
+        LLAMA_LOG_DEBUG("%s: 新的缓存大小必须大于当前大小\n", __func__);
+        return false;
+    }
+
+    if (!kv_self_resize(size)) {
+        LLAMA_LOG_DEBUG("%s: 扩容失败\n", __func__);
+        return false;
+    }
+    return true;
+}
+
+bool llama_context::kv_self_resize(uint32_t size) {
+    const int64_t t_start_us = ggml_time_us();
+            
+    ggml_backend_sched_reset(sched.get());
+
+    auto * gf = graph_init();
+
+    // 执行kv缓存管理
+    if (!kv_self->resize(ctx_compute.get(), gf, sched.get(), size)) {
+        LLAMA_LOG_ERROR("%s: kv_self resize 失败\n", __func__);
+        return false;
+    }
+
+    kv_self->head = 0;
+    cparams.n_ctx = size;
+    need_reserve = true;
+
+    // 结束计时并打印延时
+    const int64_t t_end_us = ggml_time_us();
+    LLAMA_LOG_INFO("%s: 总耗时 = %.2f ms\n", __func__, (t_end_us - t_start_us) / 1000.0);
+
+    return true;
 }
 
 enum llama_pooling_type llama_context::pooling_type() const {
@@ -1309,10 +1362,23 @@ int llama_context::decode(llama_batch & inp_batch) {
                 kv_self->head = 0;
             }
 
-            const auto slot_info = kv_self->find_slot(ubatch);
+            auto slot_info = kv_self->find_slot(ubatch);
             if (!slot_info) {
-                LLAMA_LOG_ERROR("%s: failed to prepare ubatch\n", __func__);
-                return -3;
+                LLAMA_LOG_INFO("%s: 无法找到连续的 %d 个空槽位，尝试扩容...\n", __func__, ubatch.n_tokens);
+                if(kv_self_expansion(ubatch.n_tokens)) {
+                    // 扩容成功后，重新查找槽位
+                    slot_info = kv_self->find_slot(ubatch);
+                    if(!slot_info) {
+                        LLAMA_LOG_ERROR("%s: failed to prepare ubatch\n", __func__);
+                        return -3;
+                    }
+                } else {
+                    LLAMA_LOG_ERROR("%s: failed to reserve space for ubatch\n", __func__);
+                    return -3;
+                }
+            }
+            if (need_reserve) {
+                kv_self_reserve();
             }
 
             bg.save(slot_info);
@@ -2355,6 +2421,10 @@ llama_kv_cache * llama_get_kv_self(llama_context * ctx) {
 
 void llama_kv_self_update(llama_context * ctx) {
     ctx->kv_self_update();
+}
+
+bool llama_kv_self_expansion(llama_context * ctx) {
+    return ctx->kv_self_expansion(1);
 }
 
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {

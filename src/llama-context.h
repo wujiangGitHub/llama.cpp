@@ -42,6 +42,11 @@ struct llama_context {
     const llama_kv_cache * get_kv_self() const;
 
     void kv_self_update();
+    void kv_self_reserve();
+    uint32_t kv_self_expansion_size(uint32_t n_tokens);
+    bool kv_self_expansion(uint32_t n_tokens);
+    bool kv_self_resize(uint32_t size);
+
 
     enum llama_pooling_type pooling_type() const;
 
@@ -250,6 +255,7 @@ private:
     ggml_backend_buffer_ptr buf_output;
 
     bool has_evaluated_once = false;
+    bool need_reserve       = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

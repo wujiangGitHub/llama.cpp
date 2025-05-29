@@ -52,7 +52,7 @@ bool llama_kv_cache_unified::init(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(4u*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -86,8 +86,13 @@ bool llama_kv_cache_unified::init(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+            devs.emplace_back(dev); 
+    
         } else {
             buft = ggml_backend_cpu_buffer_type();
+
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            devs.emplace_back(cpu_dev);
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: n_embd_k_gqa = %d, n_embd_v_gqa = %d, dev = %s\n", __func__,
@@ -98,6 +103,8 @@ bool llama_kv_cache_unified::init(
             LLAMA_LOG_ERROR("%s: failed to create ggml context for kv cache\n", __func__);
             return false;
         }
+        ctx_l.emplace_back(ctx);
+        buft_l.emplace_back(buft);
 
         ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*kv_size);
         ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*kv_size);
@@ -432,16 +439,12 @@ void llama_kv_cache_unified::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
 
 int32_t llama_kv_cache_unified::shift(llama_seq_id seq_id, llama_pos  n_past, int32_t n_keep) {
     // 计算滑动窗口大小
-    int32_t prefix_size = std::max(min_prefix_size, std::min(n_keep, n_past-4));
+    int32_t prefix_size = std::max(min_prefix_size, std::min(n_keep, n_past/2));
 
     int32_t window_size = n_past - prefix_size;
 
     // 计算要丢弃的token数量
-    int32_t n_discard = (int32_t)(window_size * discard_ratio);
-
-    if (n_discard <= 0) {
-        return n_discard;
-    }
+    int32_t n_discard = std::max(4, (int32_t)(window_size * discard_ratio));
 
     LLAMA_LOG_DEBUG("sliding window: prefix_size=%d, n_past=%d, n_discard=%d\n", prefix_size, n_past, n_discard);
 
@@ -721,6 +724,224 @@ llama_kv_cache_slot_info llama_kv_cache_unified::find_slot(
 
     return llama_kv_cache_slot_info(head, head + n_tokens);
 }
+
+bool llama_kv_cache_unified::get_can_resize(uint32_t size) const {
+    // 用于存储每个设备的内存需求
+    std::map<ggml_backend_dev_t, size_t> device_mem_requirements;
+    const int32_t n_layer = hparams.n_layer;
+
+    for (int i = 0; i < n_layer; i++) {
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i) + hparams.n_embd_k_s();
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
+        size_t layer_mem_size = size * (n_embd_k_gqa * ggml_type_size(type_k) +  n_embd_v_gqa * ggml_type_size(type_v));
+
+        // 获取当前层的设备
+        ggml_backend_dev_t device = devs[i];
+
+        // 累加到对应设备的内存需求
+        device_mem_requirements[device] += layer_mem_size;
+    }
+
+    for (const auto& [device, mem_size] : device_mem_requirements) {
+        size_t free, total;             
+        ggml_backend_dev_memory(device, &free, &total);
+
+        LLAMA_LOG_INFO("%s: Device %s free: %8.2f MiB, total: %8.2f MiB, kv_self_resize requires %8.2f MiB, \n", __func__,
+                    ggml_backend_dev_name(device), free / 1024.0 / 1024.0, total / 1024.0 / 1024.0,  mem_size / 1024.0 / 1024.0);
+
+        if (mem_size > free * 0.5) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool llama_kv_cache_unified::resize(ggml_context * ctx0, ggml_cgraph * gf, ggml_backend_sched * sched, uint32_t new_size) {
+
+    LLAMA_LOG_INFO("%s: 新的KV 缓存大小 %u -> %u\n", __func__, size, new_size);
+
+    const uint32_t old_size = size;
+    // 调整cells数组大小
+    cells.resize(new_size);
+    
+    // 初始化新的cells
+    for (uint32_t i = old_size; i < new_size; ++i) {
+        cells[i].pos = -1;
+        cells[i].seq_id.clear();
+        cells[i].src = -1;
+        cells[i].tail = -1;
+    }
+
+    // 准备新的数据结构
+    std::vector<ggml_tensor*> new_k_l;
+    std::vector<ggml_tensor*> new_v_l;
+    std::vector<ggml_context_ptr> new_ctxs;
+    std::vector<ggml_context*> new_ctx_l;
+    std::map<ggml_backend_buffer_type_t, ggml_context *> new_ctx_map;
+    auto res = std::make_unique<llm_graph_result>();
+    
+    const int32_t n_layer = hparams.n_layer;
+    new_k_l.reserve(n_layer);
+    new_v_l.reserve(n_layer);
+    new_ctxs.reserve(n_layer);
+
+    try {
+        // 创建一个函数用于为每种backend类型创建新的context
+        auto create_ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+            auto it = new_ctx_map.find(buft);
+            if (it == new_ctx_map.end()) {
+                ggml_init_params params = {
+                    /*.mem_size   =*/ size_t(6u*n_layer*ggml_tensor_overhead()), 
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+
+                ggml_context * ctx = ggml_init(params);
+                if (!ctx) {
+                    LLAMA_LOG_ERROR("%s: 创建新的context失败\n", __func__);
+                    return nullptr;
+                }
+
+                new_ctx_map[buft] = ctx;
+                new_ctxs.emplace_back(ctx);
+                return ctx;
+            }
+
+            return it->second;
+        };
+
+            // 创建新的tensor
+        for (int i = 0; i < n_layer; i++) {
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i) + hparams.n_embd_k_s();
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
+
+            // 为当前backend类型创建context
+            ggml_context* new_ctx = create_ctx_for_buft(buft_l[i]);
+            if (!new_ctx) {
+                LLAMA_LOG_ERROR("%s: 为层 %d 创建context失败\n", __func__, i);
+                return false;
+            }
+            new_ctx_l.emplace_back(new_ctx);
+
+            // 在新context中创建tensor
+            ggml_tensor* k = ggml_new_tensor_1d(new_ctx, type_k, n_embd_k_gqa*new_size);
+            ggml_tensor* v = ggml_new_tensor_1d(new_ctx, type_v, n_embd_v_gqa*new_size);
+            
+            if (!k || !v) {
+                LLAMA_LOG_ERROR("%s: 创建KV缓存tensor失败\n", __func__);
+                return false;
+            }
+
+            ggml_format_name(k, "cache_k_l%d", i);
+            ggml_format_name(v, "cache_v_l%d", i);
+            
+            new_k_l.push_back(k);
+            new_v_l.push_back(v);
+        }
+
+        // 分配新的缓冲区
+        std::vector<ggml_backend_buffer_ptr> new_bufs;
+        
+        for (const auto& [buft, ctx] : new_ctx_map) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            if (!buf) {
+                LLAMA_LOG_ERROR("%s: 为KV缓存分配缓冲区失败\n", __func__);
+                return false;
+            }
+            
+            ggml_backend_buffer_clear(buf, 0);
+            LLAMA_LOG_INFO("%s: %10s KV缓冲区大小 = %8.2f MiB\n", 
+                        __func__, ggml_backend_buffer_name(buf), 
+                        ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+                        
+            new_bufs.emplace_back(buf);
+        }
+
+        // 复制数据到新缓冲区
+        for (int i = 0; i < n_layer; i++) {
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i) + hparams.n_embd_k_s();
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
+            
+            // 复制K数据
+            ggml_tensor* src_k = k_l[i];
+            ggml_tensor* dst_k = new_k_l[i];
+            
+            if (src_k && dst_k) {
+                // 创建view来复制部分数据
+                ggml_tensor* src_view = ggml_view_1d(ctx_l[i], src_k, old_size * n_embd_k_gqa, 0);
+                src_view->buffer = src_k->buffer; 
+
+                ggml_tensor* dst_view = ggml_view_1d(new_ctx_l[i], dst_k, old_size * n_embd_k_gqa, 0);
+                dst_view->buffer = dst_k->buffer;
+
+                ggml_tensor* cpy_k = ggml_cpy(ctx0, src_view, dst_view);
+                ggml_format_name(cpy_k, "copy_k_l%d", i);
+                ggml_build_forward_expand(gf, cpy_k);
+            }
+            
+            // 复制V数据
+            ggml_tensor* src_v = v_l[i];
+            ggml_tensor* dst_v = new_v_l[i];
+            
+            if (src_v && dst_v) {
+                if (!v_trans) {
+                    // 非转置情况,直接复制
+                    ggml_tensor* src_view = ggml_view_1d(ctx_l[i], src_v, old_size * n_embd_v_gqa, 0);
+                    src_view->buffer = src_v->buffer;  
+
+                    ggml_tensor* dst_view = ggml_view_1d(new_ctx_l[i], dst_v, old_size * n_embd_v_gqa, 0);
+                    dst_view->buffer = dst_v->buffer;  
+
+                    ggml_tensor* cpy_v = ggml_cpy(ctx0, src_view, dst_view);
+                    ggml_format_name(cpy_v, "copy_v_l%d", i);
+                    ggml_build_forward_expand(gf, cpy_v);
+                } else {
+                    // 转置情况，使用2D视图进行优化复制
+                    ggml_tensor* src_view = ggml_view_2d(ctx_l[i], src_v, 
+                                                        old_size, n_embd_v_gqa,
+                                                        old_size * ggml_element_size(src_v), 0);
+                    src_view->buffer = src_v->buffer;
+                        
+                    ggml_tensor* dst_view = ggml_view_2d(new_ctx_l[i], dst_v,
+                                                        old_size, n_embd_v_gqa,
+                                                        new_size * ggml_element_size(dst_v), 0);
+                    dst_view->buffer = dst_v->buffer;
+                        
+                    ggml_tensor* cpy_v = ggml_cpy(ctx0, src_view, dst_view);
+                    ggml_format_name(cpy_v, "copy_v_l%d_trans", i);
+                    ggml_build_forward_expand(gf, cpy_v);
+                }
+            }
+        }
+
+        ggml_backend_sched_alloc_graph(sched, gf);
+        res->set_inputs(nullptr);
+
+        auto status = ggml_backend_sched_graph_compute_async(sched, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+            return false;
+        }
+
+        // 替换旧的张量和缓冲区
+        k_l = std::move(new_k_l);
+        v_l = std::move(new_v_l);
+        ctxs = std::move(new_ctxs);
+        ctx_l = std::move(new_ctx_l);
+        bufs = std::move(new_bufs);
+
+        // 更新大小
+        size = new_size;
+        
+        return true;
+
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: 发生异常: %s\n", __func__, e.what());
+        return false;
+    }    
+}
+
 
 uint32_t llama_kv_cache_unified::get_padding(const llama_cparams & cparams) const {
     // the FA kernels require padding to avoid extra runtime boundary checks
@@ -1407,6 +1628,17 @@ bool llama_kv_cache_can_shift(const llama_kv_cache * kv) {
 
     return kv->get_can_shift();
 }
+
+#if 0
+// 扩展KV缓存大小
+bool llama_kv_cache_resize(llama_kv_cache * kv, uint32_t new_size) {
+    if (!kv) {
+        return 0;
+    }
+
+    return kv->resize(new_size);
+}
+#endif
 
 //
 // kv cache view
