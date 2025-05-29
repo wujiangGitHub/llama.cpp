@@ -804,10 +804,29 @@ void llama_context::kv_self_reserve() {
 }
 
 uint32_t llama_context::kv_self_expansion_size(uint32_t n_tokens) {
-    uint32_t new_size = std::max(kv_self->size * 1.5, n_tokens * 1.5);
-    if (kv_self->get_can_resize(new_size)) {
-        return new_size;
-    } 
+    uint32_t new_size;
+    if (n_tokens <= n_ctx_per_seq()) {
+        new_size = kv_self->size * 2;
+        while(new_size >= n_ctx_per_seq() * 1.2) {
+            if ((new_size <= cparams.n_ctx_orig_yarn) && kv_self->get_can_resize(new_size)) {
+                return new_size;
+            }   
+            new_size /= 1.2;
+        }     
+
+    } else {
+        // 针对推理服务中prompt阶段，需要根据实际需求调整，然后在推理服务中根据最大的上下文大小进行截断
+        uint32_t temp = n_tokens * 2;
+        while(temp > n_ctx_per_seq() * 1.5) {
+            new_size = temp * cparams.n_seq_max;
+            if ((new_size <= cparams.n_ctx_orig_yarn) && kv_self->get_can_resize(new_size)) {
+                return new_size;
+            }   
+            temp /= 1.2;
+        }
+    }
+
+    // 如果没有找到合适的大小，返回 0
     return 0;
 }
 
@@ -817,7 +836,7 @@ bool llama_context::kv_self_expansion(uint32_t n_tokens) {
         LLAMA_LOG_DEBUG("%s: 没有足够的内存空间去扩容\n", __func__);
         return false;
     }
-    LLAMA_LOG_INFO("%s: (当前: %u, 扩容: %u)\n", __func__, kv_self->size, size);
+    LLAMA_LOG_DEBUG("%s: (当前: %u, 扩容: %u)\n", __func__, kv_self->size, size);
 
     if (size <= kv_self->size) {
         LLAMA_LOG_DEBUG("%s: 新的缓存大小必须大于当前大小\n", __func__);
@@ -832,7 +851,7 @@ bool llama_context::kv_self_expansion(uint32_t n_tokens) {
 }
 
 bool llama_context::kv_self_resize(uint32_t size) {
-    const int64_t t_start_us = ggml_time_us();
+    //const int64_t t_start_us = ggml_time_us();
             
     ggml_backend_sched_reset(sched.get());
 
@@ -847,10 +866,9 @@ bool llama_context::kv_self_resize(uint32_t size) {
     kv_self->head = 0;
     cparams.n_ctx = size;
     need_reserve = true;
-
-    // 结束计时并打印延时
-    const int64_t t_end_us = ggml_time_us();
-    LLAMA_LOG_INFO("%s: 总耗时 = %.2f ms\n", __func__, (t_end_us - t_start_us) / 1000.0);
+    //结束计时并打印延时
+    //const int64_t t_end_us = ggml_time_us();
+    //LLAMA_LOG_INFO("%s: 总耗时 = %.2f ms\n", __func__, (t_end_us - t_start_us) / 1000.0);
 
     return true;
 }
@@ -1355,6 +1373,9 @@ int llama_context::decode(llama_batch & inp_batch) {
         // non-causal masks do not use the KV cache
         if (hparams.causal_attn) {
             kv_self_update();
+            if (need_reserve) {
+                kv_self_reserve();
+            }
 
             // if we have enough unused cells before the current head ->
             //   better to start searching from the beginning of the cache, hoping to fill it
@@ -1364,7 +1385,9 @@ int llama_context::decode(llama_batch & inp_batch) {
 
             auto slot_info = kv_self->find_slot(ubatch);
             if (!slot_info) {
-                LLAMA_LOG_INFO("%s: 无法找到连续的 %d 个空槽位，尝试扩容...\n", __func__, ubatch.n_tokens);
+                #if 0
+                // 先由triton来调用扩容接口，这部分代码先注销
+                LLAMA_LOG_DEBUG("%s: 无法找到连续的 %d 个空槽位，尝试扩容...\n", __func__, ubatch.n_tokens);
                 if(kv_self_expansion(ubatch.n_tokens)) {
                     // 扩容成功后，重新查找槽位
                     slot_info = kv_self->find_slot(ubatch);
@@ -1373,13 +1396,12 @@ int llama_context::decode(llama_batch & inp_batch) {
                         return -3;
                     }
                 } else {
+                #endif
                     LLAMA_LOG_ERROR("%s: failed to reserve space for ubatch\n", __func__);
                     return -3;
-                }
+                //}
             }
-            if (need_reserve) {
-                kv_self_reserve();
-            }
+            
 
             bg.save(slot_info);
 
@@ -2423,8 +2445,9 @@ void llama_kv_self_update(llama_context * ctx) {
     ctx->kv_self_update();
 }
 
-bool llama_kv_self_expansion(llama_context * ctx) {
-    return ctx->kv_self_expansion(1);
+bool llama_kv_self_expansion(llama_context * ctx,
+                                uint32_t     n_token) {
+    return ctx->kv_self_expansion(n_token);
 }
 
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {

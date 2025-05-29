@@ -675,7 +675,8 @@ extern "C" {
                        int32_t     ga_w);
 
     LLAMA_API bool llama_kv_self_expansion(
-            struct llama_context * ctx);
+            struct llama_context * ctx,
+                       uint32_t    n_token);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails

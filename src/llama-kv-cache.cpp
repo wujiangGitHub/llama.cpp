@@ -746,7 +746,7 @@ bool llama_kv_cache_unified::get_can_resize(uint32_t size) const {
         size_t free, total;             
         ggml_backend_dev_memory(device, &free, &total);
 
-        LLAMA_LOG_INFO("%s: Device %s free: %8.2f MiB, total: %8.2f MiB, kv_self_resize requires %8.2f MiB, \n", __func__,
+        LLAMA_LOG_DEBUG("%s: Device %s free: %8.2f MiB, total: %8.2f MiB, kv_self_resize requires %8.2f MiB, \n", __func__,
                     ggml_backend_dev_name(device), free / 1024.0 / 1024.0, total / 1024.0 / 1024.0,  mem_size / 1024.0 / 1024.0);
 
         if (mem_size > free * 0.5) {
@@ -759,7 +759,7 @@ bool llama_kv_cache_unified::get_can_resize(uint32_t size) const {
 
 bool llama_kv_cache_unified::resize(ggml_context * ctx0, ggml_cgraph * gf, ggml_backend_sched * sched, uint32_t new_size) {
 
-    LLAMA_LOG_INFO("%s: 新的KV 缓存大小 %u -> %u\n", __func__, size, new_size);
+    LLAMA_LOG_DEBUG("%s: 新的KV 缓存大小 %u -> %u\n", __func__, size, new_size);
 
     const uint32_t old_size = size;
     // 调整cells数组大小
@@ -851,7 +851,7 @@ bool llama_kv_cache_unified::resize(ggml_context * ctx0, ggml_cgraph * gf, ggml_
             }
             
             ggml_backend_buffer_clear(buf, 0);
-            LLAMA_LOG_INFO("%s: %10s KV缓冲区大小 = %8.2f MiB\n", 
+            LLAMA_LOG_DEBUG("%s: %10s KV缓冲区大小 = %8.2f MiB\n", 
                         __func__, ggml_backend_buffer_name(buf), 
                         ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
                         
@@ -1629,16 +1629,6 @@ bool llama_kv_cache_can_shift(const llama_kv_cache * kv) {
     return kv->get_can_shift();
 }
 
-#if 0
-// 扩展KV缓存大小
-bool llama_kv_cache_resize(llama_kv_cache * kv, uint32_t new_size) {
-    if (!kv) {
-        return 0;
-    }
-
-    return kv->resize(new_size);
-}
-#endif
 
 //
 // kv cache view

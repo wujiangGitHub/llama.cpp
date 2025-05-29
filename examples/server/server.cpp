@@ -2825,31 +2825,39 @@ struct server_context {
         // TODO: simplify and improve
         for (server_slot & slot : slots) {
             if (slot.is_processing() && slot.n_past + 1 >= slot.n_ctx) {
-                if (!params_base.ctx_shift) {
-                    // this check is redundant (for good)
-                    // we should never get here, because generation should already stopped in process_token()
-                    slot.release();
-                    send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
-                    continue;
-                }
-
-                // Shift context
-                const int n_keep    = slot.params.n_keep + add_bos_token;
-
-                int32_t n_discard = llama_kv_self_shift(ctx, slot.id, slot.n_past , n_keep);
-                SLT_WRN(slot, "slot context shift, n_keep = %d, n_discard = %d\n", n_keep, n_discard);
-
-                if (slot.params.cache_prompt) {
-                    for (size_t i = n_keep + n_discard; i < slot.cache_tokens.size(); i++) {
-                        slot.cache_tokens[i - n_discard] = slot.cache_tokens[i];
+                SLT_DBG(slot, "try kv_self_expansion, n_past = %d, slot.n_ctx = %d\n", slot.n_past, slot.n_ctx);
+                if(llama_kv_self_expansion(ctx, 1)) {
+                        n_ctx = llama_n_ctx(ctx);
+                        for (auto& s : slots) {
+                            s.n_ctx = n_ctx / params_base.n_parallel;
+                        }
+                } else {
+                    if (!params_base.ctx_shift) {
+                        // this check is redundant (for good)
+                        // we should never get here, because generation should already stopped in process_token()
+                        slot.release();
+                        send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
+                        continue;
                     }
 
-                    slot.cache_tokens.resize(slot.cache_tokens.size() - n_discard);
+                    // Shift context
+                    const int n_keep    = slot.params.n_keep + add_bos_token;
+
+                    int32_t n_discard = llama_kv_self_shift(ctx, slot.id, slot.n_past , n_keep);
+                    SLT_WRN(slot, "slot context shift, n_keep = %d, n_discard = %d\n", n_keep, n_discard);
+
+                    if (slot.params.cache_prompt) {
+                        for (size_t i = n_keep + n_discard; i < slot.cache_tokens.size(); i++) {
+                            slot.cache_tokens[i - n_discard] = slot.cache_tokens[i];
+                        }
+
+                        slot.cache_tokens.resize(slot.cache_tokens.size() - n_discard);
+                    }
+
+                    slot.n_past -= n_discard;
+
+                    slot.truncated = true;
                 }
-
-                slot.n_past -= n_discard;
-
-                slot.truncated = true;
             }
         }
 
@@ -2972,8 +2980,15 @@ struct server_context {
                             }
                             slot.params.n_keep = std::min(slot.n_ctx - 4, slot.params.n_keep);
 
-                            // if input prompt is too big, truncate it
                             if (slot.n_prompt_tokens >= slot.n_ctx) {
+                                SLT_DBG(slot, "try prompt kv_self_expansion, n_prompt_tokens = %d, slot.n_ctx = %d\n", slot.n_prompt_tokens, slot.n_ctx);
+                                if(llama_kv_self_expansion(ctx, slot.n_prompt_tokens)) {
+                                    n_ctx = llama_n_ctx(ctx);
+                                    for (auto& s : slots) {
+                                        s.n_ctx = n_ctx / params_base.n_parallel;
+                                    }
+                                }
+                                // if input prompt is too big, truncate it
                                 const int n_left = slot.n_ctx - slot.params.n_keep;
 
                                 const int n_block_size = n_left / 2;

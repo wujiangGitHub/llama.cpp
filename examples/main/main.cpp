@@ -587,7 +587,7 @@ int main(int argc, char ** argv) {
 
                 if (n_past + (int) embd.size() >= n_ctx) {
                     
-                    if(llama_kv_self_expansion(ctx)) {
+                    if(llama_kv_self_expansion(ctx, 1)) {
                         n_ctx = llama_n_ctx(ctx);
                     } else {
                         if (!params.ctx_shift){
